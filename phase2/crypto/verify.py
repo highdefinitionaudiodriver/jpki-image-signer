@@ -15,9 +15,12 @@ phase2.crypto.verify: 高レベル検証ラッパー + 署名者氏名抽出.
 """
 from __future__ import annotations
 
-from typing import Optional, TypedDict
+from datetime import datetime, timezone
+from typing import Optional, Sequence, TypedDict
 
 from cryptography import x509 as c_x509
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric import padding, rsa, ec
 from cryptography.x509.oid import NameOID, ExtensionOID
 
 from .p7s import (
@@ -47,6 +50,8 @@ JPKI_SAN_OID_AUX_NUMBER = "1.2.392.200149.8.5.5.6"   # 補助番号 (17桁)
 class VerifyResult(TypedDict, total=False):
     """verify_signed_image() の戻り値辞書."""
     valid: bool
+    # 署名値と画像データの整合性 (有効期間/チェーン/失効とは独立)
+    signature_valid: bool
     # 抽出した署名者氏名 (JPKI OtherName優先 → DirectoryName CN → Subject CN)
     signer_name: Optional[str]
     # 'san_jpki_other_name' / 'san_directory_name' / 'subject_cn' / 'unknown'
@@ -56,6 +61,14 @@ class VerifyResult(TypedDict, total=False):
     # 証明書の有効期間 (ISO 8601)
     not_valid_before: Optional[str]
     not_valid_after: Optional[str]
+    # 検証時刻が NotBefore <= now <= NotAfter の範囲内であるか
+    validity_period_ok: bool
+    # チェーン検証結果。trust_anchors 未指定時は None。
+    chain_verified: Optional[bool]
+    chain_error: Optional[str]
+    # 失効確認結果: 'good' | 'revoked' | 'unknown' | 'not_checked'
+    revocation_status: str
+    revocation_detail: Optional[str]
     # 構造的エラー (検証以前の問題があった場合)
     error: Optional[str]
 
@@ -206,35 +219,250 @@ def _safe_validity(cert: c_x509.Certificate) -> tuple[Optional[str], Optional[st
             return None, None
 
 
+def _cert_validity_window(cert: c_x509.Certificate) -> tuple[Optional[datetime], Optional[datetime]]:
+    """有効期間を aware datetime (UTC) で返す."""
+    try:
+        return cert.not_valid_before_utc, cert.not_valid_after_utc
+    except AttributeError:
+        try:
+            nvb = cert.not_valid_before
+            nva = cert.not_valid_after
+            if nvb.tzinfo is None:
+                nvb = nvb.replace(tzinfo=timezone.utc)
+            if nva.tzinfo is None:
+                nva = nva.replace(tzinfo=timezone.utc)
+            return nvb, nva
+        except Exception:
+            return None, None
+
+
+def _is_within_validity_period(cert: c_x509.Certificate, now: Optional[datetime] = None) -> bool:
+    """NotBefore <= now <= NotAfter であるか。取得できない場合は False を返す。"""
+    nvb, nva = _cert_validity_window(cert)
+    if nvb is None or nva is None:
+        return False
+    if now is None:
+        now = datetime.now(timezone.utc)
+    return nvb <= now <= nva
+
+
+def _verify_cert_signed_by(child: c_x509.Certificate, issuer: c_x509.Certificate) -> bool:
+    """child の署名が issuer の公開鍵で検証できるか。"""
+    try:
+        if child.issuer != issuer.subject:
+            return False
+        pub = issuer.public_key()
+        sig = child.signature
+        tbs = child.tbs_certificate_bytes
+        algo = child.signature_hash_algorithm
+        if isinstance(pub, rsa.RSAPublicKey):
+            pub.verify(sig, tbs, padding.PKCS1v15(), algo)
+        elif isinstance(pub, ec.EllipticCurvePublicKey):
+            pub.verify(sig, tbs, ec.ECDSA(algo))
+        else:
+            return False
+        return True
+    except InvalidSignature:
+        return False
+    except Exception:
+        return False
+
+
+def _verify_chain(
+    leaf: c_x509.Certificate,
+    intermediates: Sequence[c_x509.Certificate],
+    trust_anchors: Sequence[c_x509.Certificate],
+    now: Optional[datetime] = None,
+) -> tuple[bool, Optional[str]]:
+    """leaf -> intermediates -> trust_anchors のチェーンを検証する。
+
+    検証内容:
+      - 各段で issuer.subject == child.issuer
+      - 各段で署名が親の公開鍵で検証できる
+      - 各証明書の有効期間に検証時刻が含まれる
+      - チェーンが trust_anchor のいずれかに到達する
+
+    フルPKIX (名前制約・ポリシー・拡張) は実施しない。最低限の信頼経路確認。
+    """
+    if not trust_anchors:
+        return False, "trust_anchors が空です"
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    # 全証明書の有効期間を確認
+    for cert in [leaf, *intermediates]:
+        if not _is_within_validity_period(cert, now):
+            return False, f"証明書の有効期間外: {_safe_subject_cn(cert) or '(CN不明)'}"
+
+    current = leaf
+    visited = set()  # ループ防止用
+    pool = list(intermediates) + list(trust_anchors)
+    max_depth = 10
+    for _ in range(max_depth):
+        fp = current.fingerprint(current.signature_hash_algorithm)
+        if fp in visited:
+            return False, "チェーンに循環があります"
+        visited.add(fp)
+
+        # current が trust_anchor 自身であれば成功
+        for ta in trust_anchors:
+            if current.subject == ta.subject and current.fingerprint(current.signature_hash_algorithm) == ta.fingerprint(ta.signature_hash_algorithm):
+                return True, None
+
+        # current の issuer を探す
+        issuer = None
+        for candidate in pool:
+            if candidate.subject == current.issuer and _verify_cert_signed_by(current, candidate):
+                # trust_anchor に到達した場合、その時点で有効期間も確認
+                if candidate in trust_anchors and not _is_within_validity_period(candidate, now):
+                    return False, f"信頼アンカーの有効期間外: {_safe_subject_cn(candidate) or '(CN不明)'}"
+                issuer = candidate
+                break
+
+        if issuer is None:
+            return False, f"発行元証明書が見つかりません: issuer={current.issuer.rfc4514_string()}"
+
+        # trust_anchor に到達したか
+        if issuer in trust_anchors:
+            return True, None
+        current = issuer
+
+    return False, "チェーン深度上限に達しました"
+
+
+def _check_revocation(
+    cert: c_x509.Certificate,
+    crls: Sequence[c_x509.CertificateRevocationList],
+    issuer: Optional[c_x509.Certificate] = None,
+) -> tuple[str, Optional[str]]:
+    """CRL に基づき失効状態を返す。
+
+    Returns:
+        ('good' | 'revoked' | 'unknown', detail) のタプル。
+        - 'good'    : シリアル番号がいずれのCRLにも含まれていない
+        - 'revoked' : 該当シリアル番号がCRLで失効登録されている
+        - 'unknown' : 一致するCRLが見つからない / 検証不能
+    """
+    if not crls:
+        return "unknown", "CRLが指定されていません"
+
+    serial = cert.serial_number
+    matched_any_issuer = False
+    for crl in crls:
+        # CRL の発行者が cert の issuer と一致するもののみ評価
+        if crl.issuer != cert.issuer:
+            continue
+        matched_any_issuer = True
+        # issuer が分かれば CRL の署名検証も実施
+        if issuer is not None:
+            try:
+                if not crl.is_signature_valid(issuer.public_key()):
+                    return "unknown", "CRL署名が不正です"
+            except Exception as e:
+                return "unknown", f"CRL署名検証に失敗: {type(e).__name__}"
+        revoked = crl.get_revoked_certificate_by_serial_number(serial)
+        if revoked is not None:
+            return "revoked", f"serial={serial:x} がCRLで失効登録されています"
+
+    if not matched_any_issuer:
+        return "unknown", "対象証明書の発行者と一致するCRLがありません"
+    return "good", None
+
+
+def _load_certs(cert_blobs: Optional[Sequence[bytes]]) -> list[c_x509.Certificate]:
+    """DER / PEM の両方を許容して証明書を読み込む。"""
+    result: list[c_x509.Certificate] = []
+    if not cert_blobs:
+        return result
+    for blob in cert_blobs:
+        try:
+            result.append(c_x509.load_der_x509_certificate(blob))
+            continue
+        except Exception:
+            pass
+        try:
+            result.append(c_x509.load_pem_x509_certificate(blob))
+        except Exception:
+            pass
+    return result
+
+
+def _load_crls(crl_blobs: Optional[Sequence[bytes]]) -> list[c_x509.CertificateRevocationList]:
+    """DER / PEM の両方を許容してCRLを読み込む。"""
+    result: list[c_x509.CertificateRevocationList] = []
+    if not crl_blobs:
+        return result
+    for blob in crl_blobs:
+        try:
+            result.append(c_x509.load_der_x509_crl(blob))
+            continue
+        except Exception:
+            pass
+        try:
+            result.append(c_x509.load_pem_x509_crl(blob))
+        except Exception:
+            pass
+    return result
+
+
 # ==============================================================
 # 高レベル検証ラッパー
 # ==============================================================
 
-def verify_signed_image(image_bytes: bytes, p7s_bytes: bytes) -> VerifyResult:
+def verify_signed_image(
+    image_bytes: bytes,
+    p7s_bytes: bytes,
+    *,
+    trust_anchors: Optional[Sequence[bytes]] = None,
+    intermediate_certs: Optional[Sequence[bytes]] = None,
+    crls: Optional[Sequence[bytes]] = None,
+    check_validity_period: bool = True,
+    now: Optional[datetime] = None,
+) -> VerifyResult:
     """
     画像と分離署名(p7s)を検証して結果を辞書で返す。
 
+    Args:
+        image_bytes: 検証対象の画像バイト列
+        p7s_bytes:   分離署名 (CMS/PKCS#7) バイト列
+        trust_anchors: JPKI 署名用CAなどのルート/中間CA証明書 (DER または PEM)。
+                       省略時はチェーン検証を行わない (chain_verified=None)。
+        intermediate_certs: 任意の中間CA証明書群 (DER または PEM)
+        crls: CRL バイト列 (DER または PEM)。省略時は失効確認を行わない。
+        check_validity_period: True の場合、署名者証明書の有効期間を valid に反映する。
+        now: 検証時刻 (UTC aware datetime)。テスト用途で固定可能。
+
     Returns:
-        VerifyResult dict :
-          - valid:                bool
-          - signer_name:          Optional[str]  (JPKI OtherName 優先で抽出)
-          - signer_name_source:   str  ('san_jpki_other_name' 等)
-          - signer_cn:            Optional[str]  (Subject CN, JPKIでは識別符号)
-          - not_valid_before/after: Optional[str]
+        VerifyResult dict (主要キー):
+          - valid:                bool  (署名 + 有効期間 + (任意)チェーン + (任意)失効)
+          - signature_valid:      bool  (署名値と画像の整合性のみ)
+          - signer_name / signer_name_source / signer_cn
+          - not_valid_before/after / validity_period_ok
+          - chain_verified:       Optional[bool]
+          - chain_error:          Optional[str]
+          - revocation_status:    'good' | 'revoked' | 'unknown' | 'not_checked'
+          - revocation_detail:    Optional[str]
           - error:                Optional[str]
     """
     result: VerifyResult = {
         "valid": False,
+        "signature_valid": False,
         "signer_name": None,
         "signer_name_source": "unknown",
         "signer_cn": None,
         "not_valid_before": None,
         "not_valid_after": None,
+        "validity_period_ok": False,
+        "chain_verified": None,
+        "chain_error": None,
+        "revocation_status": "not_checked",
+        "revocation_detail": None,
         "error": None,
     }
 
     try:
-        result["valid"] = verify_p7s_against_data(p7s_bytes, image_bytes)
+        sig_ok = verify_p7s_against_data(p7s_bytes, image_bytes)
+        result["signature_valid"] = sig_ok
 
         cert_der = extract_signer_cert_der(p7s_bytes)
         cert = c_x509.load_der_x509_certificate(cert_der)
@@ -248,6 +476,42 @@ def verify_signed_image(image_bytes: bytes, p7s_bytes: bytes) -> VerifyResult:
         nvb, nva = _safe_validity(cert)
         result["not_valid_before"] = nvb
         result["not_valid_after"] = nva
+
+        # 有効期間チェック
+        validity_ok = _is_within_validity_period(cert, now)
+        result["validity_period_ok"] = validity_ok
+
+        # チェーン検証 (trust_anchors が指定された場合のみ)
+        trust_certs = _load_certs(trust_anchors)
+        intermediate_objs = _load_certs(intermediate_certs)
+        chain_ok: Optional[bool] = None
+        if trust_certs:
+            chain_ok, chain_err = _verify_chain(cert, intermediate_objs, trust_certs, now)
+            result["chain_verified"] = chain_ok
+            result["chain_error"] = chain_err
+
+        # 失効確認 (CRL が指定された場合のみ)
+        crl_objs = _load_crls(crls)
+        if crl_objs:
+            # CRL の署名検証用に、cert の発行元証明書を中間+信頼アンカーから探索
+            issuer_cert = None
+            for c in list(intermediate_objs) + list(trust_certs):
+                if c.subject == cert.issuer:
+                    issuer_cert = c
+                    break
+            rev_status, rev_detail = _check_revocation(cert, crl_objs, issuer_cert)
+            result["revocation_status"] = rev_status
+            result["revocation_detail"] = rev_detail
+
+        # 総合 valid 判定
+        overall = sig_ok
+        if check_validity_period:
+            overall = overall and validity_ok
+        if chain_ok is not None:
+            overall = overall and chain_ok
+        if result["revocation_status"] == "revoked":
+            overall = False
+        result["valid"] = overall
 
     except P7sVerificationError as e:
         result["error"] = f"P7sVerificationError: {e}"
