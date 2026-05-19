@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README に「これは何？（30秒で）」「想定ユースケース・価格帯」セクションを追加
 - SECURITY.md を追加（脆弱性報告フロー）
 - 商用利用・カスタマイズ依頼の連絡先を README 末尾に明記
+- docs/SPEC.md — `.jpkiimg` フォーマット仕様 v1.0（CC0、第三者検証ツール実装可能）
+- **docs/WORKFLOW.md** — クリエイター向け運用ガイド（4 シナリオ：SNS 投稿／物販イベント／AI 区別／コミッション）
+  - 「絶対にやってはいけないこと」と「推奨運用」のセキュリティガイドライン
+  - JPKI 検証側ツールとの連携手順
+  - プロフィール「本人作証明バッジ」運用案
 
 ## [0.1.0] - 2026-05-04
 
